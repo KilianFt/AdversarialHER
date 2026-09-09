@@ -149,4 +149,3 @@ python evaluate.py --checkpoint checkpoints/01_ours_dual_her_rlpd_best.pt --epis
 
 Trajectory visualization figures are saved to `eval_results/mode0_ep*.png` and `eval_results/mode1_ep*.png`.
 
-# AdverserialHER
