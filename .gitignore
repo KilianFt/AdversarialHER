@@ -1,6 +1,10 @@
 logs/
-models/
-__pycache__/
 checkpoints/
 eval_results/
 wandb/
+__pycache__/
+*.pt
+*.pth
+*.egg-info/
+.pytest_cache/
+.venv/
