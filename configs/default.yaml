@@ -1,0 +1,67 @@
+# Default Configuration for Adversarial HER with RLPD in MultiGoal0
+
+seed: 42
+device: "auto"  # "auto", "cpu", "cuda", or "mps"
+
+env:
+  id: "MultiGoal0"
+  num_agents: 2
+  arena_size: 2.5       # Arena bounding box: [-2.5, 2.5] in x and y
+  agent_radius: 0.15    # Radius of each point robot
+  goal_radius: 0.3      # Radius for goal attainment
+  collision_threshold: 0.3  # Distance between agent centers for collision detection (2 * radius)
+  max_episode_steps: 200
+  action_limit: 1.0
+  dense_reward_scale: 1.0
+  goal_reward: 5.0
+  collision_reward: 5.0
+  loss_penalty: 2.5
+  dwell_steps: 20       # 20 steps * 0.1s = 2.0s dwell time in goal
+  dwell_reward_rate: 0.05
+  control_cost_weight: 0.001
+
+rollout:
+  # Mode distribution when collecting rollout episodes:
+  # 0: Goal-Seeking mode (target is assigned stationary goal)
+  # 1: Adversarial / Collision mode (target is other robot)
+  mode_distribution: "mixed"  # "mixed", "random", "goal_only", "adversarial_only"
+  mixed_weights: [0.5, 0.25, 0.25]  # [both goal, one adv one goal, both adv]
+
+her:
+  enabled: true
+  her_ratio: 0.8         # Fraction of transitions to relabel
+  strategy: "future"     # "future" or "final"
+  num_future_goals: 4    # k in standard HER
+  crash_relabel: true    # Automatically relabel crashing trajectories as mode 1 (Adversarial)
+  crash_window: 25       # How many preceding steps before crash to relabel as adversarial pursuit
+  crash_reward: 5.0
+
+rlpd:
+  utd_ratio: 4           # Update-to-data ratio (gradient steps per environment transition)
+  batch_size: 256
+
+  gamma: 0.99
+  tau: 0.005
+  actor_lr: 0.0003
+  critic_lr: 0.0003
+  alpha_lr: 0.0003
+  init_temperature: 0.2
+  auto_entropy_tuning: true
+  target_entropy: -1.0   # -dim(A)/2 as in official RLPD
+  num_critics: 10        # Ensemble size with LayerNorm (official RLPD REDQ architecture)
+  hidden_dims: [256, 256]
+  buffer_capacity: 500000
+  mode_balanced: true    # 50/50 balanced sampling between Goal (Mode 0) and Adversarial (Mode 1)
+
+  mode_sampling_ratio: 0.5  # Fraction of Mode 0 in each training batch (0.5 = 50% Mode 0, 50% Mode 1)
+
+train:
+
+  total_timesteps: 100000
+  warmup_steps: 2000     # Random exploration steps before training
+  eval_interval: 10000   # Evaluate every N steps
+  eval_episodes: 5       # 5 episodes per mode (10 total) during training
+  save_interval: 20000
+  log_dir: "logs"
+  checkpoint_dir: "checkpoints"
+

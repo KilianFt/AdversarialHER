@@ -1,0 +1,6 @@
+logs/
+models/
+__pycache__/
+checkpoints/
+eval_results/
+wandb/
