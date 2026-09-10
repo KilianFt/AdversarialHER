@@ -98,11 +98,14 @@ class DualModeHERRelabeler:
 
 
     def relabel_trajectory(
-        self, trajectory: List[StepData]
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        self, trajectory: List[StepData], return_collisions: bool = False
+    ) -> Tuple[np.ndarray, ...]:
         """Relabel a single agent's trajectory using Dual-Mode HER.
 
-        Returns (obs_batch, action_batch, reward_batch, next_obs_batch, done_batch).
+        If return_collisions is False:
+            Returns (obs_batch, action_batch, reward_batch, next_obs_batch, done_batch).
+        If return_collisions is True:
+            Returns (obs_batch, action_batch, reward_batch, next_obs_batch, done_batch, coll_batch).
         """
         T = len(trajectory)
         if T == 0:
@@ -110,6 +113,9 @@ class DualModeHERRelabeler:
             empty_act = np.empty((0, 2), dtype=np.float32)
             empty_rew = np.empty((0,), dtype=np.float32)
             empty_done = np.empty((0,), dtype=bool)
+            if return_collisions:
+                empty_coll = np.empty((0,), dtype=np.float32)
+                return empty_obs, empty_act, empty_rew, empty_obs, empty_done, empty_coll
             return empty_obs, empty_act, empty_rew, empty_obs, empty_done
 
         obs_list = []
@@ -117,6 +123,7 @@ class DualModeHERRelabeler:
         reward_list = []
         next_obs_list = []
         done_list = []
+        coll_list = []
 
         # 1. Add all original transitions
         for step in trajectory:
@@ -125,6 +132,8 @@ class DualModeHERRelabeler:
             reward_list.append(step.reward)
             next_obs_list.append(step.next_obs)
             done_list.append(step.done)
+            step_coll = 1.0 if (getattr(step, "collision", False) or getattr(step, "obstacle_collision", False)) else 0.0
+            coll_list.append(step_coll)
 
         # 2. Crash Relabeling (Mode 1: Adversarial HER)
         # Identify all steps where an inter-agent collision occurred
@@ -180,6 +189,7 @@ class DualModeHERRelabeler:
                     reward_list.append(r_relabeled)
                     next_obs_list.append(relabeled_next_obs)
                     done_list.append(d_relabeled)
+                    coll_list.append(1.0 if t == t_crash else 0.0)
 
         # 3. Obstacle Collision Relabeling (Mode 1: Adversarial HER targeting obstacles)
         # Scalable foundation for Safety-Gym Level 1 obstacle avoidance
@@ -235,6 +245,7 @@ class DualModeHERRelabeler:
                     reward_list.append(r_relabeled)
                     next_obs_list.append(relabeled_next_obs)
                     done_list.append(d_relabeled)
+                    coll_list.append(1.0 if t == t_crash else 0.0)
 
         # 4. Goal Relabeling (Mode 0: Crash-Free Goal HER with Dwell Synchronization)
         if self.enable_goal_her:
@@ -300,6 +311,7 @@ class DualModeHERRelabeler:
                     reward_list.append(r_relabeled)
                     next_obs_list.append(relabeled_next_obs)
                     done_list.append(d_relabeled)
+                    coll_list.append(0.0)
 
                     # Synthesize stationary dwell completion sequence for this achieved goal
                     goal_key = (round(float(achieved_goal[0]), 3), round(float(achieved_goal[1]), 3))
@@ -330,9 +342,20 @@ class DualModeHERRelabeler:
                             reward_list.append(r_dwell)
                             next_obs_list.append(dwell_obs)
                             done_list.append(d_dwell)
+                            coll_list.append(0.0)
 
 
 
+
+        if return_collisions:
+            return (
+                np.array(obs_list, dtype=np.float32),
+                np.array(action_list, dtype=np.float32),
+                np.array(reward_list, dtype=np.float32),
+                np.array(next_obs_list, dtype=np.float32),
+                np.array(done_list, dtype=bool),
+                np.array(coll_list, dtype=np.float32),
+            )
 
         return (
             np.array(obs_list, dtype=np.float32),

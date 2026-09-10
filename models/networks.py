@@ -72,6 +72,122 @@ class CriticEnsemble(nn.Module):
         return self.critics[0](x)
 
 
+class DualityCriticEnsemble(nn.Module):
+    """Ensemble of factorized Q-networks decomposing navigation progress from collision outcomes.
+
+    Architecture:
+        Q_eff(s, a, mode) = Q_nav(s_nav, a) + sigma(mode) * Q_coll(s_contact, a)
+
+    Inductive Bias:
+        - Q_nav: Learns pure navigation progress and control efficiency.
+        - Q_coll: Non-negative collision potential (via Softplus) representing expected contact.
+        - sigma(mode): +collision_reward (+5.0) in Mode 1 (Adversarial Attractor),
+                       -loss_penalty (-2.5) in Mode 0 (Obstacle/Agent Repeller).
+    """
+
+    def __init__(
+        self,
+        obs_dim: int,
+        act_dim: int,
+        hidden_dims: List[int] = [256, 256],
+        num_critics: int = 2,
+        use_layernorm: bool = True,
+        collision_reward: float = 5.0,
+        loss_penalty: float = 2.5,
+    ):
+        super().__init__()
+        self.obs_dim = obs_dim
+        self.act_dim = act_dim
+        self.hidden_dims = hidden_dims
+        self.num_critics = num_critics
+        self.use_layernorm = use_layernorm
+        self.collision_reward = collision_reward
+        self.loss_penalty = loss_penalty
+
+        if obs_dim >= 17:
+            # MultiGoal observation layout
+            nav_in_dim = 10 + act_dim
+            if obs_dim >= 33:
+                contact_in_dim = 24 + act_dim
+            else:
+                contact_in_dim = 8 + act_dim
+        else:
+            nav_in_dim = obs_dim + act_dim
+            contact_in_dim = obs_dim + act_dim
+
+        # Navigation ensemble (unbounded Q-values for distance progress & control cost)
+        self.nav_critics = nn.ModuleList([
+            LayerNormMLP(nav_in_dim, 1, hidden_dims, use_layernorm=use_layernorm)
+            for _ in range(num_critics)
+        ])
+
+        # Collision ensemble (strictly bounded in [0, 1] via Sigmoid)
+        self.coll_critics = nn.ModuleList([
+            nn.Sequential(
+                LayerNormMLP(contact_in_dim, 1, hidden_dims, use_layernorm=use_layernorm),
+                nn.Sigmoid(),
+            )
+            for _ in range(num_critics)
+        ])
+
+    def _extract_inputs(
+        self, obs: torch.Tensor, act: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Extract navigation and contact feature representations from (obs, act)."""
+        if obs.shape[-1] >= 17:
+            # MultiGoal observation layout
+            # 0:2: vel_local, 3:5: compass, 5:8: rel_goal + dist_goal, 14:17: target_ego + dist_target
+            s_nav = torch.cat(
+                [obs[..., 0:2], obs[..., 3:5], obs[..., 5:8], obs[..., 14:17], act],
+                dim=-1,
+            )
+            if obs.shape[-1] >= 33:
+                # 0:3: vel_local + rot_vel, 8:13: rel_other + vel_other + dist_other, 17:33: hazards_lidar
+                s_contact = torch.cat(
+                    [obs[..., 0:3], obs[..., 8:13], obs[..., 17:33], act],
+                    dim=-1,
+                )
+            else:
+                s_contact = torch.cat(
+                    [obs[..., 0:3], obs[..., 8:13], act],
+                    dim=-1,
+                )
+            mode = obs[..., 13:14]
+        else:
+            # Fallback for generic low-dimensional observation spaces
+            s_nav = torch.cat([obs, act], dim=-1)
+            s_contact = torch.cat([obs, act], dim=-1)
+            mode = torch.zeros((*obs.shape[:-1], 1), device=obs.device, dtype=obs.dtype)
+
+        return s_nav, s_contact, mode
+
+    def forward_components(
+        self, obs: torch.Tensor, act: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Returns (q_navs, q_colls) each of shape (num_critics, batch_size, 1)."""
+        s_nav, s_contact, _ = self._extract_inputs(obs, act)
+        q_navs = torch.stack([c(s_nav) for c in self.nav_critics], dim=0)
+        q_colls = torch.stack([c(s_contact) for c in self.coll_critics], dim=0)
+        return q_navs, q_colls
+
+    def forward(self, obs: torch.Tensor, act: torch.Tensor) -> torch.Tensor:
+        """Evaluate all critics on (obs, act), returning Q_eff = Q_nav + sigma(mode) * Q_coll.
+
+        Returns tensor of shape (num_critics, batch_size, 1).
+        """
+        s_nav, s_contact, mode = self._extract_inputs(obs, act)
+        sigma = torch.where(mode >= 0.5, self.collision_reward, -self.loss_penalty)
+        q_navs = torch.stack([c(s_nav) for c in self.nav_critics], dim=0)
+        q_colls = torch.stack([c(s_contact) for c in self.coll_critics], dim=0)
+        return q_navs + sigma * q_colls
+
+    def q1(self, obs: torch.Tensor, act: torch.Tensor) -> torch.Tensor:
+        """First critic value."""
+        s_nav, s_contact, mode = self._extract_inputs(obs, act)
+        sigma = torch.where(mode >= 0.5, self.collision_reward, -self.loss_penalty)
+        return self.nav_critics[0](s_nav) + sigma * self.coll_critics[0](s_contact)
+
+
 class SquashedGaussianPolicy(nn.Module):
     """Continuous action policy with Tanh squashing."""
 

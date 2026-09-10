@@ -133,3 +133,33 @@ def test_obstacle_crash_relabeling():
     assert relabeled_obs[-1][13] == 1.0
 
 
+def test_her_collision_flag_recording():
+    """Verify that return_collisions=True outputs matching 6-tuple with exact collision indicators."""
+    relabeler = DualModeHERRelabeler(enable_goal_her=False, enable_crash_her=True)
+    trajectory = []
+    for t in range(5):
+        is_crash = (t == 4)
+        step = StepData(
+            pos_self=np.array([float(t), 0.0]), rot_self=0.0, vel_self=np.zeros(2), rot_vel_self=0.0,
+            next_pos_self=np.array([float(t) + 0.1, 0.0]), next_rot_self=0.0, next_vel_self=np.zeros(2), next_rot_vel_self=0.0,
+            pos_other=np.array([5.0, 0.0]), vel_other=np.zeros(2), next_pos_other=np.array([5.0, 0.0]), next_vel_other=np.zeros(2),
+            goal_pos=np.array([10.0, 0.0]), nominal_mode=0.0, action=np.zeros(2),
+            collision=is_crash, goal_reached=False,
+            obs=np.zeros(33, dtype=np.float32), next_obs=np.zeros(33, dtype=np.float32), reward=0.0, done=is_crash,
+        )
+        trajectory.append(step)
+
+    obs, act, rew, next_obs, done, coll = relabeler.relabel_trajectory(trajectory, return_collisions=True)
+    assert len(obs) == len(coll)
+    assert coll.shape == (len(obs),)
+    # 5 original + 5 crash-relabeled = 10 transitions
+    assert len(coll) == 10
+    # Collision flag should be 1.0 at step 4 (original crash) and step 9 (relabeled crash)
+    assert coll[4] == 1.0
+    assert coll[9] == 1.0
+    # Other steps should be 0.0
+    assert np.all(coll[:4] == 0.0)
+    assert np.all(coll[5:9] == 0.0)
+
+
+

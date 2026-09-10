@@ -14,7 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 
-from models.networks import CriticEnsemble, SquashedGaussianPolicy
+from models.networks import CriticEnsemble, DualityCriticEnsemble, SquashedGaussianPolicy
 from replay.replay_buffer import ReplayBuffer
 
 
@@ -28,7 +28,6 @@ class RLPDAgent:
         hidden_dims: List[int] = [256, 256],
         num_critics: int = 10,
         actor_lr: float = 3e-4,
-
         critic_lr: float = 3e-4,
         alpha_lr: float = 3e-4,
         init_temperature: float = 0.2,
@@ -38,10 +37,14 @@ class RLPDAgent:
         auto_entropy_tuning: bool = True,
         use_layernorm: bool = True,
         loss_type: str = "smooth_l1",
+        critic_type: str = "standard",
+        collision_reward: float = 5.0,
+        loss_penalty: float = 2.5,
         device: torch.device = torch.device("cpu"),
     ):
         self.obs_dim = obs_dim
         self.act_dim = act_dim
+        self.hidden_dims = hidden_dims
         self.gamma = gamma
         self.tau = tau
         self.auto_entropy_tuning = auto_entropy_tuning
@@ -49,6 +52,9 @@ class RLPDAgent:
         self.num_critics = num_critics
         self.use_layernorm = use_layernorm
         self.loss_type = loss_type
+        self.critic_type = critic_type
+        self.collision_reward = collision_reward
+        self.loss_penalty = loss_penalty
 
         # 1. Actor network
         self.actor = SquashedGaussianPolicy(
@@ -62,14 +68,25 @@ class RLPDAgent:
         for param in self.cpu_actor.parameters():
             param.requires_grad = False
 
-        # 2. Critic Ensemble with LayerNorm
-        self.critics = CriticEnsemble(
-            obs_dim=obs_dim,
-            act_dim=act_dim,
-            hidden_dims=hidden_dims,
-            num_critics=num_critics,
-            use_layernorm=use_layernorm,
-        ).to(device)
+        # 2. Critic Ensemble (Standard or Duality with LayerNorm)
+        if self.critic_type == "duality":
+            self.critics = DualityCriticEnsemble(
+                obs_dim=obs_dim,
+                act_dim=act_dim,
+                hidden_dims=hidden_dims,
+                num_critics=num_critics,
+                use_layernorm=use_layernorm,
+                collision_reward=collision_reward,
+                loss_penalty=loss_penalty,
+            ).to(device)
+        else:
+            self.critics = CriticEnsemble(
+                obs_dim=obs_dim,
+                act_dim=act_dim,
+                hidden_dims=hidden_dims,
+                num_critics=num_critics,
+                use_layernorm=use_layernorm,
+            ).to(device)
 
         # Target critic ensemble
         self.target_critics = copy.deepcopy(self.critics).to(device)
@@ -85,7 +102,6 @@ class RLPDAgent:
             self.target_entropy = -float(act_dim) / 2.0
         else:
             self.target_entropy = target_entropy
-
 
         self.log_alpha = torch.tensor(np.log(init_temperature), dtype=torch.float32, requires_grad=True, device=device)
         self.alpha_optimizer = optim.Adam([self.log_alpha], lr=alpha_lr)
@@ -134,32 +150,70 @@ class RLPDAgent:
         rews = batch["rewards"]
         next_obs = batch["next_observations"]
         dones = batch["dones"]
+        colls = batch.get("collisions", torch.zeros_like(rews))
 
         # ===================
         # 1. Update Critics
         # ===================
-        with torch.no_grad():
-            next_acts, next_log_prob = self.actor(next_obs, deterministic=False, with_log_prob=True)
-            # Evaluate target critic ensemble on next state-action
-            target_qs = self.target_critics(next_obs, next_acts)  # (num_critics, batch_size, 1)
+        alpha_val = self.log_alpha.exp()
 
-            # Subsample 2 critics for target min
-            if self.num_critics > 2:
-                subset = np.random.choice(self.num_critics, 2, replace=False)
-                min_target_q = torch.min(target_qs[subset], dim=0)[0]
+        if self.critic_type == "duality":
+            with torch.no_grad():
+                next_acts, next_log_prob = self.actor(next_obs, deterministic=False, with_log_prob=True)
+                target_nav_qs, target_coll_qs = self.target_critics.forward_components(next_obs, next_acts)
+
+                # Subsample 2 critics for target min
+                if self.num_critics > 2:
+                    subset = np.random.choice(self.num_critics, 2, replace=False)
+                    min_target_nav = torch.min(target_nav_qs[subset], dim=0)[0]
+                else:
+                    min_target_nav = torch.min(target_nav_qs, dim=0)[0]
+
+                target_v_nav = min_target_nav - alpha_val * next_log_prob
+
+                # Mode extraction for reward decomposition
+                if obs.shape[-1] > 13:
+                    mode = obs[:, 13:14]
+                else:
+                    mode = torch.zeros_like(rews)
+                sigma = torch.where(mode >= 0.5, self.collision_reward, -self.loss_penalty)
+
+                # Pure navigation target (strips collision bonus/penalty)
+                r_nav = rews - sigma * colls
+                q_nav_target = r_nav + self.gamma * (1.0 - dones) * target_v_nav
+
+                # Collision target (discounted expected contact bounded in [0, 1])
+                mean_target_coll = torch.mean(target_coll_qs, dim=0)
+                q_coll_target = torch.clamp(colls + self.gamma * (1.0 - dones) * mean_target_coll, 0.0, 1.0)
+
+            current_nav_qs, current_coll_qs = self.critics.forward_components(obs, acts)
+            if self.loss_type == "smooth_l1":
+                critic_nav_loss = 0.5 * sum(F.smooth_l1_loss(current_nav_qs[i], q_nav_target, beta=1.0) for i in range(self.num_critics))
+                critic_coll_loss = 0.5 * sum(F.smooth_l1_loss(current_coll_qs[i], q_coll_target, beta=1.0) for i in range(self.num_critics))
             else:
-                min_target_q = torch.min(target_qs, dim=0)[0]
+                critic_nav_loss = 0.5 * sum(F.mse_loss(current_nav_qs[i], q_nav_target) for i in range(self.num_critics))
+                critic_coll_loss = 0.5 * sum(F.mse_loss(current_coll_qs[i], q_coll_target) for i in range(self.num_critics))
 
-            alpha_val = self.log_alpha.exp()
-            target_v = min_target_q - alpha_val * next_log_prob
-            q_target = rews + self.gamma * (1.0 - dones) * target_v
-
-        # Evaluate online critics
-        current_qs = self.critics(obs, acts)  # (num_critics, batch_size, 1)
-        if self.loss_type == "smooth_l1":
-            critic_loss = 0.5 * sum(F.smooth_l1_loss(current_qs[i], q_target, beta=1.0) for i in range(self.num_critics))
+            critic_loss = critic_nav_loss + critic_coll_loss
         else:
-            critic_loss = 0.5 * sum(F.mse_loss(current_qs[i], q_target) for i in range(self.num_critics))
+            with torch.no_grad():
+                next_acts, next_log_prob = self.actor(next_obs, deterministic=False, with_log_prob=True)
+                target_qs = self.target_critics(next_obs, next_acts)  # (num_critics, batch_size, 1)
+
+                if self.num_critics > 2:
+                    subset = np.random.choice(self.num_critics, 2, replace=False)
+                    min_target_q = torch.min(target_qs[subset], dim=0)[0]
+                else:
+                    min_target_q = torch.min(target_qs, dim=0)[0]
+
+                target_v = min_target_q - alpha_val * next_log_prob
+                q_target = rews + self.gamma * (1.0 - dones) * target_v
+
+            current_qs = self.critics(obs, acts)  # (num_critics, batch_size, 1)
+            if self.loss_type == "smooth_l1":
+                critic_loss = 0.5 * sum(F.smooth_l1_loss(current_qs[i], q_target, beta=1.0) for i in range(self.num_critics))
+            else:
+                critic_loss = 0.5 * sum(F.mse_loss(current_qs[i], q_target) for i in range(self.num_critics))
 
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
@@ -199,14 +253,20 @@ class RLPDAgent:
             torch._foreach_mul_(tc_params, 1.0 - self.tau)
             torch._foreach_add_(tc_params, c_params, alpha=self.tau)
 
-
-        return {
+        metrics = {
             "critic_loss": critic_loss.item(),
             "actor_loss": actor_loss.item(),
             "alpha_loss": alpha_loss.item(),
             "alpha": self.alpha,
             "mean_q": min_pred_q.mean().item(),
         }
+        if self.critic_type == "duality":
+            metrics["critic_nav_loss"] = critic_nav_loss.item()
+            metrics["critic_coll_loss"] = critic_coll_loss.item()
+            metrics["mean_q_coll"] = current_coll_qs.mean().item()
+            metrics["mean_q_nav"] = current_nav_qs.mean().item()
+
+        return metrics
 
     def update_rlpd(
         self,
@@ -240,6 +300,7 @@ class RLPDAgent:
                 "critics": self.critics.state_dict(),
                 "target_critics": self.target_critics.state_dict(),
                 "log_alpha": self.log_alpha,
+                "critic_type": self.critic_type,
             },
             filepath,
         )
@@ -248,6 +309,30 @@ class RLPDAgent:
         """Load model checkpoint."""
         checkpoint = torch.load(filepath, map_location=self.device)
         self.actor.load_state_dict(checkpoint["actor"])
+        ckpt_critic_type = checkpoint.get("critic_type", "standard")
+        if ckpt_critic_type != self.critic_type:
+            self.critic_type = ckpt_critic_type
+            if ckpt_critic_type == "duality":
+                self.critics = DualityCriticEnsemble(
+                    obs_dim=self.obs_dim,
+                    act_dim=self.act_dim,
+                    hidden_dims=self.hidden_dims,
+                    num_critics=self.num_critics,
+                    use_layernorm=self.use_layernorm,
+                    collision_reward=self.collision_reward,
+                    loss_penalty=self.loss_penalty,
+                ).to(self.device)
+            else:
+                self.critics = CriticEnsemble(
+                    obs_dim=self.obs_dim,
+                    act_dim=self.act_dim,
+                    hidden_dims=self.hidden_dims,
+                    num_critics=self.num_critics,
+                    use_layernorm=self.use_layernorm,
+                ).to(self.device)
+            self.target_critics = copy.deepcopy(self.critics).to(self.device)
+            self.critic_optimizer = optim.Adam(self.critics.parameters(), lr=self.critic_optimizer.param_groups[0]["lr"])
+
         self.critics.load_state_dict(checkpoint["critics"])
         self.target_critics.load_state_dict(checkpoint["target_critics"])
         self.log_alpha.data.copy_(checkpoint["log_alpha"].data)

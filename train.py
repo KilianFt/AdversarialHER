@@ -88,6 +88,14 @@ def parse_args():
         help="Device to use ('cuda', 'cuda:0', 'mps', 'cpu', or 'auto')",
     )
 
+    parser.add_argument(
+        "--critic_type",
+        type=str,
+        default="standard",
+        choices=["standard", "duality"],
+        help="Critic architecture: 'standard' (monolithic Q-ensemble) or 'duality' (factorized Q-ensemble with inductive sign reversal)",
+    )
+
     # Weights & Biases logging
     parser.add_argument("--wandb", action="store_true", help="Enable logging to Weights & Biases")
     parser.add_argument("--wandb_project", type=str, default="adversarial-her", help="Weights & Biases project name")
@@ -237,6 +245,7 @@ def main():
                     "level": cli_args.level,
                     "her_mode": cli_args.her_mode,
                     "use_layernorm": not cli_args.no_layernorm,
+                    "critic_type": cli_args.critic_type,
                 },
             )
             print(f"Weights & Biases initialized: project='{cli_args.wandb_project}', run='{cli_args.exp_name}'")
@@ -350,10 +359,14 @@ def main():
         target_entropy=target_entropy,
         auto_entropy_tuning=cfg["rlpd"]["auto_entropy_tuning"],
         use_layernorm=use_layernorm,
+        critic_type=cli_args.critic_type,
+        collision_reward=cfg["env"]["collision_reward"],
+        loss_penalty=loss_penalty,
         device=device,
     )
     print(
-        f"Agent Architecture: LayerNorm Critics = {use_layernorm}, "
+        f"Agent Architecture: Critic Type = {cli_args.critic_type}, "
+        f"LayerNorm Critics = {use_layernorm}, "
         f"Num Critics = {cfg['rlpd']['num_critics']}, "
         f"UTD = {cfg['rlpd']['utd_ratio']}, "
         f"Target Entropy = {agent.target_entropy:.2f}"
@@ -481,12 +494,12 @@ def main():
             ep_goal_reached = False
 
             # Relabel Agent 0 and Agent 1 trajectories
-            r_obs0, r_act0, r_rew0, r_nobs0, r_done0 = her_relabeler.relabel_trajectory(traj0)
-            r_obs1, r_act1, r_rew1, r_nobs1, r_done1 = her_relabeler.relabel_trajectory(traj1)
+            r_obs0, r_act0, r_rew0, r_nobs0, r_done0, r_coll0 = her_relabeler.relabel_trajectory(traj0, return_collisions=True)
+            r_obs1, r_act1, r_rew1, r_nobs1, r_done1, r_coll1 = her_relabeler.relabel_trajectory(traj1, return_collisions=True)
 
             # Symmetrically push into the single universal buffer
-            buffer.add_batch(r_obs0, r_act0, r_rew0, r_nobs0, r_done0)
-            buffer.add_batch(r_obs1, r_act1, r_rew1, r_nobs1, r_done1)
+            buffer.add_batch(r_obs0, r_act0, r_rew0, r_nobs0, r_done0, r_coll0)
+            buffer.add_batch(r_obs1, r_act1, r_rew1, r_nobs1, r_done1, r_coll1)
 
             traj0.clear()
             traj1.clear()

@@ -17,6 +17,7 @@ class _RingBuffer:
         self.rew = np.zeros((capacity, 1), dtype=np.float32)
         self.nobs = np.zeros((capacity, obs_dim), dtype=np.float32)
         self.done = np.zeros((capacity, 1), dtype=np.float32)
+        self.coll = np.zeros((capacity, 1), dtype=np.float32)
         self.ptr = 0
         self.size = 0
 
@@ -27,10 +28,14 @@ class _RingBuffer:
         rew: np.ndarray,
         nobs: np.ndarray,
         done: np.ndarray,
+        coll: Optional[np.ndarray] = None,
     ):
         n = obs.shape[0]
         if n == 0:
             return
+
+        if coll is None:
+            coll = np.zeros(n, dtype=np.float32)
 
         end_idx = self.ptr + n
         if end_idx <= self.capacity:
@@ -39,6 +44,7 @@ class _RingBuffer:
             self.rew[self.ptr:end_idx] = rew.reshape(-1, 1)
             self.nobs[self.ptr:end_idx] = nobs
             self.done[self.ptr:end_idx] = done.reshape(-1, 1).astype(np.float32)
+            self.coll[self.ptr:end_idx] = coll.reshape(-1, 1).astype(np.float32)
         else:
             first = self.capacity - self.ptr
             second = n - first
@@ -47,12 +53,14 @@ class _RingBuffer:
             self.rew[self.ptr:] = rew[:first].reshape(-1, 1)
             self.nobs[self.ptr:] = nobs[:first]
             self.done[self.ptr:] = done[:first].reshape(-1, 1).astype(np.float32)
+            self.coll[self.ptr:] = coll[:first].reshape(-1, 1).astype(np.float32)
 
             self.obs[:second] = obs[first:]
             self.act[:second] = act[first:]
             self.rew[:second] = rew[first:].reshape(-1, 1)
             self.nobs[:second] = nobs[first:]
             self.done[:second] = done[first:].reshape(-1, 1).astype(np.float32)
+            self.coll[:second] = coll[first:].reshape(-1, 1).astype(np.float32)
 
         self.ptr = (self.ptr + n) % self.capacity
         self.size = min(self.size + n, self.capacity)
@@ -124,6 +132,7 @@ class ReplayBuffer:
         reward: float,
         next_obs: np.ndarray,
         done: bool,
+        coll: float = 0.0,
     ):
         """Add a single transition."""
         self.add_batch(
@@ -132,6 +141,7 @@ class ReplayBuffer:
             np.array([reward], dtype=np.float32),
             next_obs[np.newaxis, :],
             np.array([done], dtype=bool),
+            np.array([coll], dtype=np.float32),
         )
 
     def add_batch(
@@ -141,10 +151,14 @@ class ReplayBuffer:
         reward: np.ndarray,
         next_obs: np.ndarray,
         done: np.ndarray,
+        coll: Optional[np.ndarray] = None,
     ):
         """Add a batch of transitions, dispatching to respective mode sub-buffers."""
         if len(obs) == 0:
             return
+
+        if coll is None:
+            coll = np.zeros(len(obs), dtype=np.float32)
 
         # Mode indicator is at index 13 in the egocentric observation space (0.0=Goal, 1.0=Adversarial)
         if obs.shape[1] > 13:
@@ -156,13 +170,12 @@ class ReplayBuffer:
 
         if np.any(m0_mask):
             self.buffer_m0.add_batch(
-                obs[m0_mask], action[m0_mask], reward[m0_mask], next_obs[m0_mask], done[m0_mask]
+                obs[m0_mask], action[m0_mask], reward[m0_mask], next_obs[m0_mask], done[m0_mask], coll[m0_mask]
             )
         if np.any(m1_mask):
             self.buffer_m1.add_batch(
-                obs[m1_mask], action[m1_mask], reward[m1_mask], next_obs[m1_mask], done[m1_mask]
+                obs[m1_mask], action[m1_mask], reward[m1_mask], next_obs[m1_mask], done[m1_mask], coll[m1_mask]
             )
-
 
     def _sample_internal(self, batch_size: int) -> Dict[str, np.ndarray]:
         s0 = self.buffer_m0.size
@@ -179,6 +192,7 @@ class ReplayBuffer:
             rews = np.concatenate([self.buffer_m0.rew[idx0], self.buffer_m1.rew[idx1]])
             nobs = np.concatenate([self.buffer_m0.nobs[idx0], self.buffer_m1.nobs[idx1]])
             dones = np.concatenate([self.buffer_m0.done[idx0], self.buffer_m1.done[idx1]])
+            colls = np.concatenate([self.buffer_m0.coll[idx0], self.buffer_m1.coll[idx1]])
         elif s0 > 0:
             idx0 = self.buffer_m0.sample_indices(batch_size)
             obs = self.buffer_m0.obs[idx0]
@@ -186,6 +200,7 @@ class ReplayBuffer:
             rews = self.buffer_m0.rew[idx0]
             nobs = self.buffer_m0.nobs[idx0]
             dones = self.buffer_m0.done[idx0]
+            colls = self.buffer_m0.coll[idx0]
         elif s1 > 0:
             idx1 = self.buffer_m1.sample_indices(batch_size)
             obs = self.buffer_m1.obs[idx1]
@@ -193,10 +208,11 @@ class ReplayBuffer:
             rews = self.buffer_m1.rew[idx1]
             nobs = self.buffer_m1.nobs[idx1]
             dones = self.buffer_m1.done[idx1]
+            colls = self.buffer_m1.coll[idx1]
         else:
             raise RuntimeError("Cannot sample from an empty ReplayBuffer!")
 
-        return {"obs": obs, "acts": acts, "rews": rews, "nobs": nobs, "dones": dones}
+        return {"obs": obs, "acts": acts, "rews": rews, "nobs": nobs, "dones": dones, "colls": colls}
 
     def sample(
         self, batch_size: int, prior_buffer: Optional[ReplayBuffer] = None
@@ -214,9 +230,10 @@ class ReplayBuffer:
             rews = np.concatenate([b_online["rews"], b_prior["rews"]])
             nobs = np.concatenate([b_online["nobs"], b_prior["nobs"]])
             dones = np.concatenate([b_online["dones"], b_prior["dones"]])
+            colls = np.concatenate([b_online["colls"], b_prior["colls"]])
         else:
             b = self._sample_internal(batch_size)
-            obs, acts, rews, nobs, dones = b["obs"], b["acts"], b["rews"], b["nobs"], b["dones"]
+            obs, acts, rews, nobs, dones, colls = b["obs"], b["acts"], b["rews"], b["nobs"], b["dones"], b["colls"]
 
         return {
             "observations": torch.as_tensor(obs, device=self.device),
@@ -224,5 +241,6 @@ class ReplayBuffer:
             "rewards": torch.as_tensor(rews, device=self.device),
             "next_observations": torch.as_tensor(nobs, device=self.device),
             "dones": torch.as_tensor(dones, device=self.device),
+            "collisions": torch.as_tensor(colls, device=self.device),
         }
 
