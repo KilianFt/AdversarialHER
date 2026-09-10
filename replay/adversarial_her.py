@@ -132,7 +132,13 @@ class DualModeHERRelabeler:
             reward_list.append(step.reward)
             next_obs_list.append(step.next_obs)
             done_list.append(step.done)
-            step_coll = 1.0 if (getattr(step, "collision", False) or getattr(step, "obstacle_collision", False)) else 0.0
+            is_mode1 = (getattr(step, "nominal_mode", 0.0) >= 0.5)
+            if is_mode1:
+                # In Mode 1: collision outcome bonus (+5.0) occurs only on agent interception
+                step_coll = 1.0 if getattr(step, "collision", False) else 0.0
+            else:
+                # In Mode 0: collision outcome penalty (-2.5) occurs on hazard collision or agent collision
+                step_coll = 1.0 if (getattr(step, "collision", False) or getattr(step, "obstacle_collision", False)) else 0.0
             coll_list.append(step_coll)
 
         # 2. Crash Relabeling (Mode 1: Adversarial HER)
